@@ -12,6 +12,8 @@ const pathConfig = require('../lib/pathconfig');
 const optionDefinitions = [
     { name: 'to', type: String, description: 'The migration target' },
     { name: 'from', type: String, description: 'Set the migration to start from' },
+    { name: 'toRev', type: Number, description: 'The migration target' },
+    { name: 'fromRev', type: Number, description: 'Set the migration to start from' },
     { name: 'rollback', alias: 'b', type: Boolean, description: 'Rollback to specified revision', defaultValue: false },
     { name: 'pos', alias: 'p', type: Number, description: 'Run first migration at pos (default: 0)', defaultValue: 0 },
     { name: 'no-transaction', type: Boolean, description: 'Run each change separately instead of all in a transaction (allows it to fail and continue)', defaultValue: false },
@@ -22,12 +24,31 @@ const optionDefinitions = [
     { name: 'help', type: Boolean, description: 'Show this message' }
 ];
 
+/** 
+ * @typedef AutoMigrationFile
+ * @property {number} fulLPath The full path to the file
+ * @property {string} name The name of the file
+ * @property {AutoMigration} migration The loaded migration
+ */
+
+/** 
+ * @typedef AutoMigration
+ * @property {Object} info Migration information
+ * @property {number} info.revision The revision number
+ * @property {string} info.name The name of the migration
+ * @property {string} info.created The date the migration was created, as a string
+ * @property {string} info.comment Comments about the migration
+ * @property {number} pos The step in the migration to start running at
+ * @property {boolean} useTransaction Wrap entire migration in a transaction
+ * @property {(queryInterface: import('sequelize').QueryInterface, Sequelize: import('sequelize').Sequelize, _commands: any) => Promise<void>} migrationFiles.migration.execute `sequelize-auto-migrations` execute method
+ * @property {(queryInterface: import('sequelize').QueryInterface, Sequelize: import('sequelize').Sequelize) => Promise<void>} migrationFiles.migration.up Migration up method
+ * @property {(queryInterface: import('sequelize').QueryInterface, Sequelize: import('sequelize').Sequelize) => Promise<void>} migrationFiles.migration.down Migration down method
+ */
+
 /**
  * 
  * @param {import("sequelize").SequelizeStaticAndInstance} sequelize The sequelize instance
- * @param {Object[]} migrationFiles Migration files
- * @param {string} migrationFiles.name The name of the migration
- * @param {string} migrationFiles.fullPath The path to the migration 
+ * @param {AutoMigrationFile[]} migrationFiles Migration files
  * @param {Object} migrationOptions Options to pass to each migration
  * @param {boolean} migrationOptions.useTransaction Wrap entire migration in a transaction
  * @param {number} migrationOptions.step The step to start the migration at
@@ -38,10 +59,11 @@ function getMigrator(sequelize, migrationFiles, migrationOptions) {
         storageOptions: {
             tableName: 'SequelizeMeta',
             timestamps: false,
+            sequelize,
         },
         logging: (message, ...args) => console.log(message, ...args),
         migrations: Umzug.migrationsList(migrationFiles.map(file => {
-            const migration = require(file.fullPath);
+            const { migration } = file;
             if (!migration) throw Error(`Unable to load migration from "${file.fullPath}"`);
             if (migrationOptions.step > 0) {
                 console.log(`Set position to ${migrationOptions.step}`);
@@ -49,6 +71,8 @@ function getMigrator(sequelize, migrationFiles, migrationOptions) {
             }
             migration.useTransaction = migrationOptions.useTransaction;
             migration.name = file.name;
+            migration.up = migration.up.bind(migration);
+            migration.down = migration.down.bind(migration);
             return migration;
         }), [sequelize.getQueryInterface(), Sequelize])
     });
@@ -56,7 +80,7 @@ function getMigrator(sequelize, migrationFiles, migrationOptions) {
 }
 
 function ShowMigration(migration) {
-    console.log(`\tPending Migration: ${migration.file}`);
+    console.log(`\tMigration: ${migration.file}`);
 }
 
 /**
@@ -112,15 +136,36 @@ async function Main() {
      */
     let noTransaction = options['no-transaction'];
 
-    let migrationFiles = fs.readdirSync(migrationsDir)
+    /**
+     * @type {AutoMigrationFile[]}
+     */
+    const migrationFiles = fs.readdirSync(migrationsDir)
     // filter JS files
     .filter((file) => {
         return (file.indexOf('.') !== 0) && (file.slice(-3) === '.js');
     })
+    // Load migrations
+    .map((file) => {
+        /**
+         * @type {AutoMigrationFile}
+         */
+        return {
+            get name() {
+                return file;
+            },
+            get fullPath() {
+                return path.join(migrationsDir, file);
+            },
+            /**
+             * @type {AutoMigration}
+             */
+            migration: require(path.join(migrationsDir, file))
+        }
+    })
     // sort by revision
     .sort( (a, b) => {
-        let revA = parseInt( path.basename(a).split('-',2)[0]),
-            revB = parseInt( path.basename(b).split('-',2)[0]);
+        let revA = parseInt( path.basename(a.name).split('-',2)[0]),
+            revB = parseInt( path.basename(b.name).split('-',2)[0]);
         if (rollback) {
             if (revA < revB) return 1;
             if (revA > revB) return -1;
@@ -133,50 +178,83 @@ async function Main() {
     
     console.log("Migrations found:");  
     migrationFiles.forEach((file) => {
-        console.log(`\t${file}`);
+        console.log(`\t${file.name}`);
     });
 
-    const migrationFileList = migrationFiles.map((file) => {
-        return {
-            get name() {
-                return file;
-            },
-            get fullPath() {
-                path.join(migrationsDir, file);
-            }
-        }
-    });
-
-    const migrator = getMigrator(sequelize, migrationFileList, {
+    const migrator = getMigrator(sequelize, migrationFiles, {
         useTransaction: !noTransaction,
         step: fromPos
     });
 
     if (options.list) {
         const executed = await migrator.executed();
+        console.log(`Executed:`);
         executed.forEach(ShowMigration);
+        console.log(``);
+
         const pending = await migrator.pending();
+        console.log(`Pending:`);
         pending.forEach(ShowMigration);
+        console.log(``);
         process.exit(0);
     }
 
     try {
         const migrations = [];
+        let toMigration = null, fromMigration = null;
+        const {
+            to = undefined,
+            from = undefined,
+            toRev = undefined,
+            fromRev = undefined
+        } = options;
+        toMigration = to;
+        fromMigration = from;
+        // If we have specified a revision to go from and to go to
+        if (!toMigration && toRev && !fromMigration && fromRev)
+        {
+            if (toRev < fromRev && rollback || toRev > fromRev && !rollback) {
+                const _toMigration = migrationFiles.find(e => e.migration ? e.migration.info.revision === toRev : false);
+                const _fromMigration = migrationFiles.find(e => e.migration ? e.migration.info.revision === fromRev : false);
+                if (_toMigration && _fromMigration) {
+                    toMigration = _toMigration.name;
+                    fromMigration = _fromMigration.name;
+                }
+            }
+        } else if (!toMigration && toRev && !fromMigration && !fromRev) {
+            // If we have specified a revition to go to only 
+            const _toMigration = migrationFiles.find(e => e.migration ? e.migration.info.revision === toRev : false);
+            if (_toMigration) {
+                toMigration = _toMigration.name;
+            }
+        } else if (!toMigration && !toRev && !fromMigration && fromRev) { 
+            // If we have specified a revition to go from only
+            const _fromMigration = migrationFiles.find(e => e.migration ? e.migration.info.revision === fromRev : false);
+            if (_fromMigration) {
+                fromMigration = _fromMigration.name;
+            }
+        }
+        
         const methodOptions = { 
-            to: options.to,
-            from: options.from,
+            to: toMigration,
+            from: fromMigration,
         };
+        console.log(`Migration Options`, methodOptions)
         if (!rollback) {
+            console.log(`Migrating up`);
             const executed = await migrator.up(methodOptions);
             migrations.push(...executed);
         } else {
+            console.log(`Migrating down`);
             const executed = await migrator.down(methodOptions);
             migrations.push(...executed);
         }
-        console.log(`Executed ${migrations.length} migrations`);
+        console.log(`Executed ${migrations.length} migrations:`);
         migrations.forEach(ShowMigration);
+        process.exit(0);
     } catch (migError) {
         console.error(migError);
+        process.exit(1);
     }
 }
 
@@ -185,5 +263,6 @@ async function Main() {
         await Main();
     } catch (error) {
         console.error(error);
+        process.exit(1);
     }
 })();
